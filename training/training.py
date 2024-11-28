@@ -117,14 +117,14 @@ def parse_args():
     
     # Calculate world size after parsing arguments
     args.world_size = args.num_gpus * args.num_nodes
-    args.batch_size = int(os.environ.get("SM_HP_BATCH_SIZE", 8))  
+    args.batch_size = int(os.environ.get("SM_HP_BATCH_SIZE", 8))
     args.epochs = int(os.environ.get("SM_HP_EPOCHS", 3))
 
     # Create necessary directories
     if args.output_data_dir:
         os.makedirs(args.output_data_dir, exist_ok=True)
-    if args.checkpoint_dir:
-        os.makedirs(args.checkpoint_dir, exist_ok=True)
+    # if args.checkpoint_dir:
+    #     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     return args
 
@@ -168,6 +168,46 @@ def setup_distributed():
         return device, 0, 1
 
 
+def is_distributed():
+    return int(os.environ.get("WORLD_SIZE", 1)) > 1
+
+
+def cleanup_distributed():
+    if is_distributed():
+        dist.destroy_process_group()
+
+
+def get_txt_file_paths(directory):
+    txt_file_paths = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            if file.endswith(".txt"):
+                txt_file_paths.append(os.path.abspath(os.path.join(root, file)))
+    return txt_file_paths
+
+
+def load_dataset_audio(directory):
+    # PREPARE DATA USING FLAC FILES AND LABEL TEXT
+    # (rewrite load_dataset method)
+    # STEPS
+    # 1. GET FOLDER
+    # 2. READ TXT IN FOLDER
+    # 3. PARSE TXT BY LINE (GET FLAC FILE NAME AND LABEL)
+    # 4. MAP EACH FLAC FILE TO LABEL
+    # 5. INPUT INTO raw_datasets
+    text_files = get_txt_file_paths(directory)
+    data = []
+    
+    for text in text_files:
+        absolute_path = os.path.dirname(text)
+        with open(text, "r") as f:
+            for line in f:
+                file_name, label = line.strip().split(maxsplit=1)
+                data.append({"audio": f"{absolute_path}/{file_name}.flac", "label": label})
+
+    return Dataset.from_list(data)
+
+
 def load_datasets_from_s3():
     # Get S3 paths from SageMaker environment variables
     train_dir = os.environ.get('SM_CHANNEL_TRAIN', '')
@@ -175,30 +215,22 @@ def load_datasets_from_s3():
 
     if not train_dir or not val_dir:
         raise ValueError("Training or validation data path not provided")
-    
+
     # Load datasets directly from S3 paths
     raw_datasets = DatasetDict()
     try:
         # Load training dataset
         logger.info(f"Loading training dataset from {train_dir}")
-        raw_datasets["train"] = load_dataset(
-            'csv',  # or whatever format your data is in
-            data_files=train_dir,
-            streaming=False  # Changed to False to fully load dataset for mapping
-        )
-        
+        raw_datasets["train"] = load_dataset_audio(train_dir)
+
         # Load validation dataset
         logger.info(f"Loading validation dataset from {val_dir}")
-        raw_datasets["validation"] = load_dataset(
-            'csv',  # or whatever format your data is in
-            data_files=val_dir,
-            streaming=False
-        )
+        raw_datasets["validation"] = load_dataset_audio(val_dir)
 
     except Exception as e:
         logger.error(f"Error loading datasets from S3: {e}")
         raise
-    
+
     logger.info(f"Training dataset size: {len(raw_datasets['train'])}")
     logger.info(f"Validation dataset size: {len(raw_datasets['validation'])}")
 
@@ -431,7 +463,6 @@ def main(args):
             pin_memory=True,
             drop_last=True  # Important for distributed training
         )
-            )
 
         eval_sampler = DistributedSampler(vectorized_datasets["validation"]) if "WORLD_SIZE" in os.environ else None
         eval_dataloader = DataLoader(
@@ -464,8 +495,8 @@ def main(args):
 
     # Training Loop
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.train()
     for epoch in range(args.epochs):
+        model.train()
         logger.info(f"Starting training for epoch {epoch}.")
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -481,43 +512,43 @@ def main(args):
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     scaler.step(optimizer)
                     scaler.update()
-                    lr_scheduler.step()
                     optimizer.zero_grad()
+                    lr_scheduler.step()
             except Exception as e:
                 logger.error(f"Error during training step {step} of epoch {epoch}: {e}")
                 raise
 
         # Save checkpoint
-        checkpoint_path = os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")
-        logger.info(f"Saving checkpoint to {checkpoint_path}")
-        try:
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': lr_scheduler.state_dict(),
-                'scaler_state_dict': scaler.state_dict()
-            }, checkpoint_path)
-        except Exception as e:
-            logger.error(f"Error saving checkpoint at epoch {epoch}: {e}")
-            raise
+        # checkpoint_path = os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")
+        # logger.info(f"Saving checkpoint to {checkpoint_path}")
+        # try:
+        #     torch.save({
+        #         'epoch': epoch,
+        #         'model_state_dict': model.state_dict(),
+        #         'optimizer_state_dict': optimizer.state_dict(),
+        #         'scheduler_state_dict': lr_scheduler.state_dict(),
+        #         'scaler_state_dict': scaler.state_dict()
+        #     }, checkpoint_path)
+        # except Exception as e:
+        #     logger.error(f"Error saving checkpoint at epoch {epoch}: {e}")
+        #     raise
 
         # Evaluation Loop
-        logger.info(f"Starting evaluation for epoch {epoch}.")
-        model.eval()
-        eval_loss = 0
-        try:
-            for batch in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
-                batch = {k: v.to(device) for k, v in batch.items()}
-                with torch.no_grad():
-                    outputs = model(**batch)
-                    eval_loss += outputs.loss.item()
-            eval_loss /= len(eval_dataloader)
-            logger.info(f"Epoch {epoch}: Evaluation Loss: {eval_loss}")
-        except Exception as e:
-            logger.error(f"Error during evaluation at epoch {epoch}: {e}")
-            raise
-        model.train()
+        # logger.info(f"Starting evaluation for epoch {epoch}.")
+        # model.eval()
+        # eval_loss = 0
+        # try:
+        #     for batch in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
+        #         batch = {k: v.to(device) for k, v in batch.items()}
+        #         with torch.no_grad():
+        #             outputs = model(**batch)
+        #             eval_loss += outputs.loss.item()
+        #     eval_loss /= len(eval_dataloader)
+        #     logger.info(f"Epoch {epoch}: Evaluation Loss: {eval_loss}")
+        # except Exception as e:
+        #     logger.error(f"Error during evaluation at epoch {epoch}: {e}")
+        #     raise
+
 
 if __name__ == "__main__":
     args = parse_args()
