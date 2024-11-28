@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Union
 import datasets
 import torch
 import torch.distributed as dist
-from datasets import Dataset,DatasetDict, load_dataset
+from datasets import DatasetDict, load_dataset
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
@@ -245,15 +245,6 @@ def load_datasets_from_s3():
     return raw_datasets
 
 
-def rms_normalize_audio(audio_array, target_level=-25):
-        audio_array = audio_array.astype(np.float32)
-        rms = np.sqrt(np.mean(audio_array**2))
-        if rms > 0:
-            target_rms = 10**(target_level/20)
-            audio_array = audio_array * (target_rms/rms)
-        return audio_array
-
-
 def prepare_datasets(raw_datasets, feature_extractor, args):
     # Cast audio column with correct sampling rate
     try:
@@ -268,22 +259,21 @@ def prepare_datasets(raw_datasets, feature_extractor, args):
 
     def prepare_dataset(batch):
         sample = batch[args.audio_column_name]
-
-        audio_array = rms_normalize_audio(sample["array"])
-
+        
         try:
             inputs = feature_extractor(
-                audio_array, 
+                sample["array"], 
                 sampling_rate=sample["sampling_rate"], 
                 max_length=int(args.max_duration_in_seconds * feature_extractor.sampling_rate),
                 truncation=True
             )
             batch["input_values"] = inputs.input_values[0]
-            batch["input_length"] = len(inputs.input_values[0])
         except Exception as e:
             logger.error(f"Error during feature extraction: {e}")
             raise
         return batch
+    logger.info(f"Number of training examples: {len(vectorized_datasets['train'])}")
+    logger.info(f"Number of validation examples: {len(vectorized_datasets['validation'])}")
 
     # Set up caching for preprocessed datasets
     try:
@@ -294,20 +284,10 @@ def prepare_datasets(raw_datasets, feature_extractor, args):
             remove_columns=raw_datasets["train"].column_names,
             load_from_cache_file=True
         )
-        logger.info(f"Number of training examples: {len(vectorized_datasets['train'])}")
-        logger.info(f"Number of validation examples: {len(vectorized_datasets['validation'])}")
     except Exception as e:
         logger.error(f"Error mapping datasets: {e}")
         raise
-    # Filter samples based on length
-    min_length = int(args.max_duration_in_seconds * 0.5 * feature_extractor.sampling_rate)
-    vectorized_datasets = vectorized_datasets.filter(
-        lambda x: x["input_length"] >= min_length,
-        num_proc=args.preprocessing_num_workers
-    )
 
-    vectorized_datasets = vectorized_datasets.remove_columns("input_length")
-    
     return vectorized_datasets
 
 
@@ -345,7 +325,7 @@ def setup_model_and_data_collator(args, feature_extractor):
         logger.error(f"Error moving model to device: {e}")
         raise
     
-    if is_distributed():
+    if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
         try:
             logger.info("Wrapping model in DistributedDataParallel.")
             model = torch.nn.parallel.DistributedDataParallel(
@@ -375,7 +355,7 @@ def setup_model_and_data_collator(args, feature_extractor):
         logger.error(f"Error creating data collator: {e}")
         raise
 
-    return model, data_collator, config
+    return model, data_collator
 
 
 @dataclass
@@ -476,7 +456,7 @@ def main(args):
 
     # Setup model and data collator
     logger.info("Setting up model and data collator.")
-    model, data_collator, config = setup_model_and_data_collator(args, feature_extractor)
+    model, data_collator = setup_model_and_data_collator(args, feature_extractor)
     
     # Create DataLoaders with DistributedSampler for distributed training
     try:
@@ -506,7 +486,7 @@ def main(args):
     # Setup optimizer and learning rate scheduler
     logger.info("Setting up optimizer and learning rate scheduler.")
     try:
-        optimizer = AdamW(model.parameters(), lr=3e-4)
+        optimizer = AdamW(model.parameters(), lr=3e-5)
         num_training_steps = args.epochs * len(train_dataloader)
         lr_scheduler = get_scheduler(
             name=args.lr_scheduler_type,
@@ -520,7 +500,7 @@ def main(args):
 
     # Mixed Precision Training
     scaler = GradScaler()
-    gumbel_temperature = config.max_gumbel_temperature
+
     # Training Loop
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     for epoch in range(args.epochs):
@@ -536,22 +516,12 @@ def main(args):
                     loss = outputs.loss / args.gradient_accumulation_steps
 
                 scaler.scale(loss).backward()
-                logger.info(f"Loss at step {step}: {loss.item()}")
+
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     scaler.step(optimizer)
                     scaler.update()
-                    lr_scheduler.step()
                     optimizer.zero_grad()
-                # Update Gumbel temperature
-                gumbel_temperature = max(
-                    config.max_gumbel_temperature * args.gumbel_temperature_decay ** (step + epoch * len(train_dataloader)),
-                    config.min_gumbel_temperature
-                )
-
-                if hasattr(model, 'module'):
-                    model.module.set_gumbel_temperature(gumbel_temperature)
-                else:
-                    model.set_gumbel_temperature(gumbel_temperature)
+                    lr_scheduler.step()
             except Exception as e:
                 logger.error(f"Error during training step {step} of epoch {epoch}: {e}")
                 raise
@@ -586,8 +556,6 @@ def main(args):
         # except Exception as e:
         #     logger.error(f"Error during evaluation at epoch {epoch}: {e}")
         #     raise
-
-    cleanup_distributed()
 
 
 if __name__ == "__main__":

@@ -55,7 +55,7 @@ estimator = PyTorch(
     sagemaker_session=sagemaker.Session(boto_session=session),
 
     instance_count=1,  # Number of instances for distributed training
-    instance_type="ml.c5.xlarge" # "ml.p3.2xlarge",  # Instance type, can be adjusted based on needs
+    instance_type="ml.g4dn.2xlarge" # "ml.p3.2xlarge",  # Instance type, can be adjusted based on needs
     #use_spot_instances=True,  # Enable spot instances
 )
 
