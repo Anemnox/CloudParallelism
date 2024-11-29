@@ -116,7 +116,21 @@ def parse_args():
         default="checkpoints",
         help="Directory to save checkpoints during training.",
     )
-    
+    parser.add_argument(
+        "--max_gumbel_temperature",
+        type=float,
+        default=2.0,
+        help="Maximum temperature for gumbel softmax.",
+    )
+    parser.add_argument(
+        "--min_gumbel_temperature",
+        type=float,
+        default=0.5,
+        help="Minimum temperature for gumbel softmax.",
+    )
+    parser.add_argument(
+        "--gumbel_temperature_decay", type=float, default=0.999995, help="Decay of gumbel temperature during training."
+    )
     
     args = parser.parse_args()
     
@@ -521,8 +535,8 @@ def main(args):
 
     # Mixed Precision Training
     scaler = GradScaler()
-    gumbel_temperature = config.max_gumbel_temperature
     # Training Loop
+    completed_steps=0
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     for epoch in range(args.epochs):
         model.train()
@@ -545,14 +559,15 @@ def main(args):
                     optimizer.zero_grad()
                 # Update Gumbel temperature
                 gumbel_temperature = max(
-                    config.max_gumbel_temperature * args.gumbel_temperature_decay ** (step + epoch * len(train_dataloader)),
-                    config.min_gumbel_temperature
+                    args.max_gumbel_temperature * args.gumbel_temperature_decay**completed_steps,
+                    args.min_gumbel_temperature,
                 )
 
                 if hasattr(model, 'module'):
                     model.module.set_gumbel_temperature(gumbel_temperature)
                 else:
                     model.set_gumbel_temperature(gumbel_temperature)
+                completed_steps+=1
             except Exception as e:
                 logger.error(f"Error during training step {step} of epoch {epoch}: {e}")
                 raise

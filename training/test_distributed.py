@@ -12,7 +12,7 @@ import boto3
 session = boto3.Session()
 role = os.getenv("SAGEMAKER_ROLE")  # Role ARN that has permission to execute training jobs in SageMaker
 region = session.region_name
-bucket = "tcss562"  # Replace with your S3 bucket name
+bucket = "tcss562-west"  # Replace with your S3 bucket name
 
 # Set up S3 paths for input data and model output
 train_data_s3_uri = f"s3://{bucket}/small-test"
@@ -23,9 +23,9 @@ output_path = f"s3://{bucket}/training-output-test/"
 training_script = "training.py"
 QUOTA = 8
 SEED_NUMBER = 42
-instance_type = "ml.p2.xlarge"
+instance_type = "ml.g4dn.2xlarge"
 configurations = [
-    {"instance_count": 1, "epochs": 10}
+    {"instance_count": 2, "epochs": 10}
 ]
 
 current_instance_usage = 0
