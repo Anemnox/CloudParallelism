@@ -29,6 +29,8 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 import numpy as np
+import time
+import psutil
 
 import transformers
 from transformers import (
@@ -536,15 +538,23 @@ def main(args):
     # Mixed Precision Training
     scaler = GradScaler()
     # Training Loop
+    # Initialize the variables for network latency
+    total_network_latency = 0
+    num_network_operations = 0
     completed_steps=0
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     for epoch in range(args.epochs):
+        epoch_start_time = time.time()
+        total_throughput = 0  # Variable to accumulate throughput for the epoch
+        num_steps = 0  # Variable to count the number of steps in the epoch
         model.train()
         logger.info(f"Starting training for epoch {epoch}.")
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         for step, batch in enumerate(tqdm(train_dataloader, desc=f"Training Epoch {epoch}")):
             batch = {k: v.to(device) for k, v in batch.items()}
+            # Start time for measuring network latency
+            network_start_time = time.time()
             try:
                 with autocast():  # Mixed precision
                     outputs = model(**batch)
@@ -568,9 +578,30 @@ def main(args):
                 else:
                     model.set_gumbel_temperature(gumbel_temperature)
                 completed_steps+=1
+                throughput = 1 / (time.time() - epoch_start_time) 
+                total_throughput += throughput
+                num_steps += 1
+                
             except Exception as e:
                 logger.error(f"Error during training step {step} of epoch {epoch}: {e}")
                 raise
+                
+            # Measure the time taken for network communication
+            network_end_time = time.time()
+            network_latency = network_end_time - network_start_time
+            total_network_latency += network_latency
+            num_network_operations += 1
+    
+        
+        epoch_end_time = time.time()
+        epoch_duration = epoch_end_time - epoch_start_time
+        avg_throughput = total_throughput / num_steps if num_steps > 0 else 0
+        avg_network_latency = total_network_latency / num_network_operations if num_network_operations > 0 else 0   
+        logging.info(f"epoch {epoch + 1} training_time {epoch_duration:.2f} seconds")
+        logger.info(f"epoch {epoch + 1} throughput {avg_throughput:.2f} samples/second")
+        logger.info(f"epoch {epoch + 1} network latency {avg_network_latency:.2f} seconds")
+    
+        time.sleep(1)  # Sleep to simulate logging interval
 
         # Save checkpoint
         # checkpoint_path = os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")

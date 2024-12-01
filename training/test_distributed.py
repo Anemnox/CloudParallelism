@@ -19,13 +19,13 @@ import boto3
 
 # Initialize session and other common variables
 session = boto3.Session()
-role = os.getenv("SAGEMAKER_ROLE")  # Role ARN that has permission to execute training jobs in SageMaker
+role = ""   # Role ARN that has permission to execute training jobs in SageMaker
 region = session.region_name
-bucket = "tcss562-west"  # Replace with your S3 bucket name
+bucket = "tcss562-cloud-computing-project"  # Replace with your S3 bucket name
 
 # Set up S3 paths for input data and model output
-train_data_s3_uri = f"s3://{bucket}/small-test"
-validation_data_s3_uri = f"s3://{bucket}/small-test/"
+train_data_s3_uri = f"s3://{bucket}/small-test/dev-clean"
+validation_data_s3_uri = f"s3://{bucket}/small-test/dev-clean/"
 output_path = f"s3://{bucket}/training-output-test/"
 
 # Define different configurations to test
@@ -34,11 +34,21 @@ QUOTA = 8                                            # CURRENT QUOTA
 SEED_NUMBER = 42
 instance_type = "ml.g4dn.2xlarge"
 configurations = [
-    {"instance_count": 1, "epochs": 10},
-    #{"instance_count": 2, "epochs": 10},
+    #{"instance_count": 1, "epochs": 10},
+    {"instance_count": 2, "epochs": 10},
     #{"instance_count": 4, "epochs": 10},
     #{"instance_count": 8, "epochs": 10}
 ]
+
+# Define metric definitions
+metric_definitions = [
+    {'Name': 'network_latency', 'Regex': 'epoch \\d+ network latency ([0-9\\.]+) seconds'},
+    {'Name': 'epoch_training_time', 'Regex': 'epoch \\d+ training_time ([0-9\\.]+) seconds'},
+     {'Name': 'epoch_throughput', 'Regex': 'epoch \\d+ throughput ([0-9\\.]+) samples/second'}
+]
+
+
+
 
 current_instance_usage = 0
 lock = threading.Lock()
@@ -80,12 +90,15 @@ def train_with_config(config):
             "NCCL_SOCKET_IFNAME": "eth0",
             "NCCL_IB_DISABLE": "0",
             "NCCL_P2P_DISABLE": "0",
+            "ENABLE_SM_METRICS": "true",  # Ensures detailed metrics collection
         },
         output_path=output_path,
         sagemaker_session=Session(boto_session=session),
         instance_count=config["instance_count"],
         instance_type=instance_type,
-        enable_sagemaker_metrics=True
+        enable_sagemaker_metrics=True,
+        metric_definitions=metric_definitions  # Include the updated metrics
+        
     )
 
     train_input = TrainingInput(train_data_s3_uri)

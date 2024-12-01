@@ -1,1 +1,4 @@
 .ipynb_checkpoints/
+.LibriSpeech/
+./LibriSpeech_test/
+shrey15_accessKeys.txt

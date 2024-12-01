@@ -4,8 +4,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 # AWS S3 bucket details
-BUCKET_NAME = "tcss562-west"  # Replace with your bucket name
-LOCAL_DIRECTORY = "small-test"  # Replace with your directory path
+BUCKET_NAME = "tcss562-cloud-computing-project"  # Replace with your bucket name
+LOCAL_DIRECTORY = "LibriSpeech_test"  # Replace with your directory path
 S3_DIRECTORY = "small-test"  # Replace with your desired S3 folder path (can be empty)
 
 # Initialize S3 client
@@ -34,6 +34,7 @@ def upload_files_parallel(local_dir, s3_dir, max_workers=10):
             relative_path = os.path.relpath(local_path, local_dir)
             s3_key = os.path.join(s3_dir, relative_path).replace("\\", "/")  # For Windows compatibility
             files_to_upload.append((local_path, s3_key))
+
     
     print(f"files to upload: {len(files_to_upload)}")
     # Upload files using ThreadPoolExecutor with a progress bar
