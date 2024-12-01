@@ -8,6 +8,15 @@ from sagemaker.inputs import TrainingInput
 from sagemaker import Session
 import boto3
 
+
+
+# Things to modify
+# Data Set -> "larger test"
+# Instance counts -> "1, 2, 4, 8"
+# 
+
+
+
 # Initialize session and other common variables
 session = boto3.Session()
 role = os.getenv("SAGEMAKER_ROLE")  # Role ARN that has permission to execute training jobs in SageMaker
@@ -21,11 +30,14 @@ output_path = f"s3://{bucket}/training-output-test/"
 
 # Define different configurations to test
 training_script = "training.py"
-QUOTA = 8
+QUOTA = 8                                            # CURRENT QUOTA
 SEED_NUMBER = 42
 instance_type = "ml.g4dn.2xlarge"
 configurations = [
-    {"instance_count": 2, "epochs": 10}
+    {"instance_count": 1, "epochs": 10},
+    #{"instance_count": 2, "epochs": 10},
+    #{"instance_count": 4, "epochs": 10},
+    #{"instance_count": 8, "epochs": 10}
 ]
 
 current_instance_usage = 0
@@ -73,6 +85,7 @@ def train_with_config(config):
         sagemaker_session=Session(boto_session=session),
         instance_count=config["instance_count"],
         instance_type=instance_type,
+        enable_sagemaker_metrics=True
     )
 
     train_input = TrainingInput(train_data_s3_uri)
