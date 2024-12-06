@@ -13,11 +13,11 @@ import os
 session = boto3.Session()
 role = os.getenv("SAGEMAKER_ROLE")  # Role ARN that has permission to execute training jobs in SageMaker
 region = session.region_name
-bucket = "tcss562"  # Replace with your S3 bucket name
+bucket = "tcss562-cloud-computing-project"  # Replace with your S3 bucket name
 
 # Set up S3 paths for input data and model output
-train_data_s3_uri = f"s3://{bucket}/LibriSpeech/dev-clean"
-validation_data_s3_uri = f"s3://{bucket}/LibriSpeech/dev-clean/"
+train_data_s3_uri = f"s3://{bucket}/dev-clean"
+validation_data_s3_uri = f"s3://{bucket}/dev-clean/"
 output_path = f"s3://{bucket}/training-output-test/"
 
 
@@ -45,18 +45,17 @@ estimator = PyTorch(
         # },
         #"checkpoint_dir": f"s3://{bucket}/checkpoint",
     },
-    environment={
-        "NCCL_DEBUG": "INFO",
-        "NCCL_SOCKET_IFNAME": "eth0",  # Ensure network interface compatibility
-        "NCCL_IB_DISABLE": "0",       # Enable InfiniBand if available
-        "NCCL_P2P_DISABLE": "0",      # Enable peer-to-peer communication
-    },
+    distribution={  "smdistributed": { 
+        "dataparallel": {
+            "enabled": True, 
+            "custom_mpi_options": "-verbose -x NCCL_DEBUG=VERSION"
+        }},
     output_path=output_path,
     sagemaker_session=sagemaker.Session(boto_session=session),
 
     instance_count=1,  # Number of instances for distributed training
-    instance_type="ml.g4dn.2xlarge" # "ml.p3.2xlarge",  # Instance type, can be adjusted based on needs
-    #use_spot_instances=True,  # Enable spot instances
+    instance_type="ml.g4dn.xlarge", # "ml.p3.2xlarge",  # Instance type, can be adjusted based on needs
+    use_spot_instances=True,  # Enable spot instances
 )
 
 # Specify the training data inputs

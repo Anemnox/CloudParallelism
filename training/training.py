@@ -1,35 +1,20 @@
 #!/usr/bin/env python
 # coding=utf-8
-# Copyright 2021 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-
-"""Pre-Training a 🤖 Wav2Vec2 model on unlabeled audio data"""
-
 import argparse
 import math
 import os
 import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
-import datasets
 import torch
 import torch.distributed as dist
-from datasets import Dataset,DatasetDict, load_dataset
+import numpy as np
+import datasets
+from datasets import Dataset, DatasetDict
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
-import numpy as np
-
+import time
 import transformers
 from transformers import (
     AdamW,
@@ -38,22 +23,21 @@ from transformers import (
     Wav2Vec2FeatureExtractor,
     Wav2Vec2ForPreTraining,
     get_scheduler,
-    is_wandb_available,
     set_seed,
 )
 from transformers.models.wav2vec2.modeling_wav2vec2 import _compute_mask_indices, _sample_negative_indices
-from transformers.utils import send_example_telemetry
-
-#import smdistributed.dataparallel.torch.torch_smddp  # Import for SageMaker Distributed Data Parallel (SMDP)
+import smdistributed.dataparallel.torch.torch_smddp as smddp
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler  # Mixed precision training
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
-    
+
     parser.add_argument('--output-data-dir', type=str, default=os.environ.get('SM_OUTPUT_DATA_DIR', ''))
     parser.add_argument('--model-dir', type=str, default=os.environ.get('SM_MODEL_DIR', ''))
     parser.add_argument('--train', type=str, default=os.environ.get('SM_CHANNEL_TRAIN', ''))
@@ -63,8 +47,7 @@ def parse_args():
     parser.add_argument("--num-gpus", type=int, default=int(os.environ.get("SM_NUM_GPUS", 1)))
     parser.add_argument("--audio_column_name", type=str, default="audio", help="Name of the audio column.")
     parser.add_argument("--num_nodes", type=int, default=len(os.environ.get("SM_HOSTS", [])))
-    parser.add_argument("--epochs",type=int,default=1)
-    # Additional arguments for feature extraction, distributed training, etc.
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument(
         "--model_name_or_path",
         type=str,
@@ -98,19 +81,6 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=0, help="A seed for reproducible training.")
     parser.add_argument(
-        "--max_duration_in_seconds",
-        type=float,
-        default=5.0,
-        help="Filter out audio files that are longer than `max_duration_in_seconds` seconds",
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        default="nccl",
-        help="Type of distributed backend to use",
-        choices= ["nccl","smddp"]
-    )
-    parser.add_argument(
         "--checkpoint_dir",
         type=str,
         default="checkpoints",
@@ -131,9 +101,8 @@ def parse_args():
     parser.add_argument(
         "--gumbel_temperature_decay", type=float, default=0.999995, help="Decay of gumbel temperature during training."
     )
-    
     args = parser.parse_args()
-    
+
     # Validate gradient accumulation steps
     if args.gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be greater than 0")
@@ -141,61 +110,44 @@ def parse_args():
     # Calculate world size after parsing arguments
     args.world_size = args.num_gpus * args.num_nodes
     args.batch_size = int(os.environ.get("SM_HP_BATCH_SIZE", 8))
-    #args.epochs = int(os.environ.get("SM_HP_EPOCHS", 3))
 
     # Create necessary directories
     if args.output_data_dir:
         os.makedirs(args.output_data_dir, exist_ok=True)
-    # if args.checkpoint_dir:
-    #     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     return args
 
 
 def setup_distributed():
-    if "WORLD_SIZE" in os.environ:
-        try:
-            # SageMaker SMDP environment variables
-            world_size = int(os.environ["WORLD_SIZE"])
-            rank = int(os.environ["RANK"])
-            local_rank = int(os.environ["LOCAL_RANK"])
-            
-            # Initialize distributed process group
-            dist.init_process_group(
-                backend=args.backend,
-                rank=rank,
-                world_size=world_size
-            )
-            
-            # Set device
+    try:
+        if smddp.is_available:
+            logger.info("Initializing SageMaker Distributed Data Parallel (SMDP).")
+            dist.init_process_group(backend="smddp")
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+            local_rank = rank % torch.cuda.device_count()
             torch.cuda.set_device(local_rank)
             device = torch.device("cuda", local_rank)
             logger.info(f"Initialized distributed process group with rank {rank}, world size {world_size}, and local rank {local_rank}.")
-            if torch.cuda.is_available():
-                # Log GPU memory info
-                logger.info(f"GPU Memory: {torch.cuda.get_device_properties(local_rank).total_memory / 1024**3:.2f} GB")
-                # Enable cuDNN benchmarking for better performance
-                torch.backends.cudnn.benchmark = True
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            rank = 0
+            world_size = 1
+            local_rank = 0
+            logger.info("Distributed training not enabled. Using device: %s", device)
         
-                    
-            return device, local_rank, world_size
-        except KeyError as e:
-            logger.error(f"Missing environment variable for distributed training: {e}")
-            raise
-        except RuntimeError as e:
-            logger.error(f"Failed to initialize distributed process group: {e}")
-            raise
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info("Distributed training not enabled. Using device: %s", device)
-        return device, 0, 1
+        return device, local_rank, world_size
+    except RuntimeError as e:
+        logger.error(f"Failed to initialize distributed process group: {e}")
+        raise
 
 
 def is_distributed():
-    return int(os.environ.get("WORLD_SIZE", 1)) > 1
+    return smddp.is_available and dist.get_world_size() > 1
 
 
 def cleanup_distributed():
+    torch.cuda.empty_cache()
     if is_distributed():
         dist.destroy_process_group()
 
@@ -210,14 +162,6 @@ def get_txt_file_paths(directory):
 
 
 def load_dataset_audio(directory):
-    # PREPARE DATA USING FLAC FILES AND LABEL TEXT
-    # (rewrite load_dataset method)
-    # STEPS
-    # 1. GET FOLDER
-    # 2. READ TXT IN FOLDER
-    # 3. PARSE TXT BY LINE (GET FLAC FILE NAME AND LABEL)
-    # 4. MAP EACH FLAC FILE TO LABEL
-    # 5. INPUT INTO raw_datasets
     text_files = get_txt_file_paths(directory)
     data = []
     
@@ -232,21 +176,17 @@ def load_dataset_audio(directory):
 
 
 def load_datasets_from_s3():
-    # Get S3 paths from SageMaker environment variables
     train_dir = os.environ.get('SM_CHANNEL_TRAIN', '')
     val_dir = os.environ.get('SM_CHANNEL_VALIDATION', '')
 
     if not train_dir or not val_dir:
         raise ValueError("Training or validation data path not provided")
 
-    # Load datasets directly from S3 paths
     raw_datasets = DatasetDict()
     try:
-        # Load training dataset
         logger.info(f"Loading training dataset from {train_dir}")
         raw_datasets["train"] = load_dataset_audio(train_dir)
 
-        # Load validation dataset
         logger.info(f"Loading validation dataset from {val_dir}")
         raw_datasets["validation"] = load_dataset_audio(val_dir)
 
@@ -261,16 +201,15 @@ def load_datasets_from_s3():
 
 
 def rms_normalize_audio(audio_array, target_level=-25):
-        audio_array = audio_array.astype(np.float32)
-        rms = np.sqrt(np.mean(audio_array**2))
-        if rms > 0:
-            target_rms = 10**(target_level/20)
-            audio_array = audio_array * (target_rms/rms)
-        return audio_array
+    audio_array = audio_array.astype(np.float32)
+    rms = np.sqrt(np.mean(audio_array**2))
+    if rms > 0:
+        target_rms = 10**(target_level/20)
+        audio_array = audio_array * (target_rms/rms)
+    return audio_array
 
 
 def prepare_datasets(raw_datasets, feature_extractor, args):
-    # Cast audio column with correct sampling rate
     try:
         logger.info("Casting audio column to the correct sampling rate.")
         raw_datasets = raw_datasets.cast_column(
@@ -283,24 +222,21 @@ def prepare_datasets(raw_datasets, feature_extractor, args):
 
     def prepare_dataset(batch):
         sample = batch[args.audio_column_name]
-
         audio_array = rms_normalize_audio(sample["array"])
 
         try:
             inputs = feature_extractor(
-                audio_array, 
-                sampling_rate=sample["sampling_rate"], 
-                max_length=int(args.max_duration_in_seconds * feature_extractor.sampling_rate),
+                audio_array,
+                sampling_rate=sample["sampling_rate"],
+                max_length=int(10 * feature_extractor.sampling_rate),  # Set max_length here
                 truncation=True
             )
             batch["input_values"] = inputs.input_values[0]
-            batch["input_length"] = len(inputs.input_values[0])
         except Exception as e:
             logger.error(f"Error during feature extraction: {e}")
             raise
         return batch
 
-    # Set up caching for preprocessed datasets
     try:
         logger.info("Mapping datasets with feature extraction.")
         vectorized_datasets = raw_datasets.map(
@@ -314,20 +250,18 @@ def prepare_datasets(raw_datasets, feature_extractor, args):
     except Exception as e:
         logger.error(f"Error mapping datasets: {e}")
         raise
-    # Filter samples based on length
-    min_length = int(args.max_duration_in_seconds * 0.5 * feature_extractor.sampling_rate)
-    vectorized_datasets = vectorized_datasets.filter(
-        lambda x: x["input_length"] >= min_length,
-        num_proc=args.preprocessing_num_workers
-    )
 
-    vectorized_datasets = vectorized_datasets.remove_columns("input_length")
-    
     return vectorized_datasets
 
 
 def setup_model_and_data_collator(args, feature_extractor):
-    # Load model config
+    try:
+        device, local_rank, world_size = setup_distributed()
+        logger.info(f"Distributed setup complete. Device: {device}, Local rank: {local_rank}, World size: {world_size}")
+    except Exception as e:
+        logger.error(f"Error setting up distributed environment: {e}")
+        raise
+
     try:
         logger.info(f"Loading model configuration from {args.model_name_or_path}")
         config = Wav2Vec2Config.from_pretrained(args.model_name_or_path)
@@ -335,48 +269,31 @@ def setup_model_and_data_collator(args, feature_extractor):
         logger.error(f"Error loading model configuration: {e}")
         raise
 
-    # Initialize model
     try:
         logger.info("Initializing the Wav2Vec2 model for pre-training.")
         model = Wav2Vec2ForPreTraining(config)
-    except Exception as e:
-        logger.error(f"Error initializing model: {e}")
-        raise
-
-    # Enable gradient checkpointing if specified
-    if hasattr(args, 'gradient_checkpointing') and args.gradient_checkpointing:
-        try:
-            logger.info("Enabling gradient checkpointing for the model.")
-            model.gradient_checkpointing_enable()
-        except Exception as e:
-            logger.error(f"Error enabling gradient checkpointing: {e}")
-            raise
-
-    # Move model to GPU and wrap in SMDP if distributed
-    try:
-        device, local_rank, _ = setup_distributed()
         model = model.to(device)
+        logger.info(f"Model moved to device: {device}")
+        
+        if hasattr(args, 'gradient_checkpointing') and args.gradient_checkpointing:
+            if hasattr(model, 'gradient_checkpointing_enable'):
+                model.gradient_checkpointing_enable()
+                logger.info("Gradient checkpointing enabled")
+            else:
+                logger.warning("Gradient checkpointing not supported by this model")
+        
+        if is_distributed():
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+            logger.info("Model wrapped in DistributedDataParallel")
+            
     except Exception as e:
-        logger.error(f"Error moving model to device: {e}")
+        logger.error(f"Error setting up model: {e}")
         raise
-    
-    if is_distributed():
-        try:
-            logger.info("Wrapping model in DistributedDataParallel.")
-            model = torch.nn.parallel.DistributedDataParallel(
-                model,
-                device_ids=[local_rank],
-                output_device=local_rank
-            )
-        except Exception as e:
-            logger.error(f"Error wrapping model in DistributedDataParallel: {e}")
-            raise
 
-    # Setup masking parameters for data collator
-    mask_time_prob = config.mask_time_prob if hasattr(config, 'mask_time_prob') else 0.065
-    mask_time_length = config.mask_time_length if hasattr(config, 'mask_time_length') else 10
+    mask_time_prob = getattr(config, 'mask_time_prob', 0.065)
+    mask_time_length = getattr(config, 'mask_time_length', 10)
+    logger.info(f"Using mask_time_prob={mask_time_prob}, mask_time_length={mask_time_length}")
 
-    # Create data collator
     try:
         logger.info("Creating data collator for Wav2Vec2 pretraining.")
         data_collator = DataCollatorForWav2Vec2Pretraining(
@@ -386,20 +303,15 @@ def setup_model_and_data_collator(args, feature_extractor):
             mask_time_prob=mask_time_prob,
             mask_time_length=mask_time_length,
         )
+        logger.info("Data collator created successfully.")
     except Exception as e:
         logger.error(f"Error creating data collator: {e}")
         raise
 
-    return model, data_collator, config
-
+    return model, data_collator, config, device
 
 @dataclass
 class DataCollatorForWav2Vec2Pretraining:
-    """
-    Data collator that will dynamically pad the inputs received and prepare masked indices
-    for self-supervised pretraining.
-    """
-
     model: Wav2Vec2ForPreTraining
     feature_extractor: Wav2Vec2FeatureExtractor
     padding: Union[bool, str] = "longest"
@@ -408,76 +320,69 @@ class DataCollatorForWav2Vec2Pretraining:
     mask_time_length: Optional[int] = 10
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        # Reformat list to dict and set to pytorch format
         try:
-            logger.debug("Padding batch of features.")
+            # Make sure the padding is done to max_length
             batch = self.feature_extractor.pad(
                 features,
-                padding=self.padding,
+                padding=self.padding,  # Use max_length to ensure consistency
                 pad_to_multiple_of=self.pad_to_multiple_of,
                 return_tensors="pt",
             )
-        except Exception as e:
-            logger.error(f"Error during padding of features: {e}")
-            raise
 
-        device = batch["input_values"].device
-        batch_size = batch["input_values"].shape[0]
+            # Ensure mask indices are computed based on the consistent max_length
+            batch_size = batch["input_values"].shape[0]
+            actual_model = self.model.module if hasattr(self.model, "module") else self.model
 
-        try:
-            mask_indices_seq_length = self.model._get_feat_extract_output_lengths(batch["input_values"].shape[-1])
+            mask_indices_seq_length = actual_model._get_feat_extract_output_lengths(
+                batch["input_values"].shape[-1]
+            )
             mask_indices_seq_length = int(mask_indices_seq_length)
 
-            # Make sure that no loss is computed on padded inputs
-            if batch.get("attention_mask") is not None:
-                logger.debug("Computing sub-attention mask for padded inputs.")
-                batch["sub_attention_mask"] = self.model._get_feature_vector_attention_mask(
-                    mask_indices_seq_length, batch["attention_mask"]
+            if mask_indices_seq_length <= 0:
+                raise ValueError(f"Invalid mask indices sequence length: {mask_indices_seq_length}")
+
+            if "attention_mask" in batch:
+                batch["sub_attention_mask"] = actual_model._get_feature_vector_attention_mask(
+                    mask_indices_seq_length,
+                    batch["attention_mask"]
                 )
 
             features_shape = (batch_size, mask_indices_seq_length)
 
-            # Sample randomly masked indices
-            logger.debug("Sampling masked time indices.")
+            # Compute mask indices based on the fixed max_length shape
             mask_time_indices = _compute_mask_indices(
                 features_shape,
                 self.mask_time_prob,
                 self.mask_time_length,
-                attention_mask=batch.get("sub_attention_mask"),
+                attention_mask=batch.get("sub_attention_mask")
             )
 
-            # Sample negative indices
-            logger.debug("Sampling negative indices for contrastive learning.")
+            negative_count = actual_model.config.num_negatives
             sampled_negative_indices = _sample_negative_indices(
                 features_shape,
-                self.model.config.num_negatives,
-                mask_time_indices=mask_time_indices,
+                negative_count,
+                mask_time_indices=mask_time_indices
             )
-            batch["mask_time_indices"] = torch.tensor(mask_time_indices, dtype=torch.long, device=device)
-            batch["sampled_negative_indices"] = torch.tensor(sampled_negative_indices, dtype=torch.long, device=device)
-            logger.debug(f"Batch size: {batch_size}")
-            logger.debug(f"Mask indices sequence length: {mask_indices_seq_length}")
-            logger.debug(f"Features shape: {features_shape}")
-        except Exception as e:
-            logger.error(f"Error during data collation: {e}")
-            raise
 
-        return batch
+            # Convert mask indices and sampled negative indices to tensors
+            batch["mask_time_indices"] = torch.tensor(mask_time_indices, dtype=torch.long)
+            batch["sampled_negative_indices"] = torch.tensor(sampled_negative_indices, dtype=torch.long)
+
+            return batch
+
+        except Exception as e:
+            logger.error(f"Error in data collation: {str(e)}")
+            raise
 
 
 def main(args):
-    send_example_telemetry("run_wav2vec2_pretraining_no_trainer", args)
-
-    # Set the training seed now.
     if args.seed is not None:
         logger.info(f"Setting seed for reproducibility: {args.seed}")
         set_seed(args.seed)
     
-    # Load dataset
     logger.info("Loading datasets from S3.")
     raw_datasets = load_datasets_from_s3()
     
-    # Initialize feature extractor
     try:
         logger.info(f"Loading feature extractor from {args.model_name_or_path}")
         feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(args.model_name_or_path)
@@ -485,17 +390,18 @@ def main(args):
         logger.error(f"Error loading feature extractor: {e}")
         raise
     
-    # Prepare datasets
     logger.info("Preparing datasets for training.")
     vectorized_datasets = prepare_datasets(raw_datasets, feature_extractor, args)
 
-    # Setup model and data collator
     logger.info("Setting up model and data collator.")
-    model, data_collator, config = setup_model_and_data_collator(args, feature_extractor)
+    model, data_collator, config, device = setup_model_and_data_collator(args, feature_extractor)
     
-    # Create DataLoaders with DistributedSampler for distributed training
     try:
-        train_sampler = DistributedSampler(vectorized_datasets["train"]) if "WORLD_SIZE" in os.environ else None
+        train_sampler = DistributedSampler(
+            vectorized_datasets['train'],
+            num_replicas=dist.get_world_size() if is_distributed() else 1,
+            rank=dist.get_rank() if is_distributed() else 0
+        )
         train_dataloader = DataLoader(
             vectorized_datasets["train"],
             batch_size=args.per_device_train_batch_size,
@@ -504,21 +410,12 @@ def main(args):
             sampler=train_sampler,
             num_workers=args.preprocessing_num_workers,
             pin_memory=True,
-            drop_last=True  # Important for distributed training
-        )
-
-        eval_sampler = DistributedSampler(vectorized_datasets["validation"]) if "WORLD_SIZE" in os.environ else None
-        eval_dataloader = DataLoader(
-            vectorized_datasets["validation"],
-            batch_size=args.per_device_train_batch_size,
-            collate_fn=data_collator,
-            sampler=eval_sampler,
+            drop_last=True
         )
     except Exception as e:
         logger.error(f"Error creating DataLoaders: {e}")
         raise
 
-    # Setup optimizer and learning rate scheduler
     logger.info("Setting up optimizer and learning rate scheduler.")
     try:
         optimizer = AdamW(model.parameters(), lr=3e-4)
@@ -533,76 +430,56 @@ def main(args):
         logger.error(f"Error setting up optimizer or learning rate scheduler: {e}")
         raise
 
-    # Mixed Precision Training
     scaler = GradScaler()
-    # Training Loop
-    completed_steps=0
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    completed_steps = 0
     for epoch in range(args.epochs):
+        epoch_start_time = time.time()
+        total_network_latency = 0
+        num_network_operations = 0
+        num_steps = 0
+
         model.train()
         logger.info(f"Starting training for epoch {epoch}.")
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        for step, batch in enumerate(tqdm(train_dataloader, desc=f"Training Epoch {epoch}")):
-            batch = {k: v.to(device) for k, v in batch.items()}
+        iterator = train_dataloader
+        if not is_distributed() or dist.get_rank() == 0:
+            iterator = tqdm(iterator, desc=f"Training Epoch {epoch}")
+        
+        for step, batch in enumerate(iterator):
             try:
-                with autocast():  # Mixed precision
+                batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                network_start_time = time.time()
+                with autocast():
                     outputs = model(**batch)
                     loss = outputs.loss / args.gradient_accumulation_steps
-
                 scaler.scale(loss).backward()
-                logger.info(f"Loss at step {step}: {loss.item()}")
                 if (step + 1) % args.gradient_accumulation_steps == 0:
                     scaler.step(optimizer)
                     scaler.update()
                     lr_scheduler.step()
                     optimizer.zero_grad()
-                # Update Gumbel temperature
-                gumbel_temperature = max(
-                    args.max_gumbel_temperature * args.gumbel_temperature_decay**completed_steps,
-                    args.min_gumbel_temperature,
-                )
-
-                if hasattr(model, 'module'):
-                    model.module.set_gumbel_temperature(gumbel_temperature)
-                else:
-                    model.set_gumbel_temperature(gumbel_temperature)
-                completed_steps+=1
+                completed_steps += 1
+                num_steps += 1
+                network_latency = time.time() - network_start_time
+                total_network_latency += network_latency
+                num_network_operations += 1
+                if step % 100 == 0 and is_distributed():
+                    torch.cuda.synchronize()
             except Exception as e:
                 logger.error(f"Error during training step {step} of epoch {epoch}: {e}")
+                if is_distributed():
+                    cleanup_distributed()
                 raise
-
-        # Save checkpoint
-        # checkpoint_path = os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")
-        # logger.info(f"Saving checkpoint to {checkpoint_path}")
-        # try:
-        #     torch.save({
-        #         'epoch': epoch,
-        #         'model_state_dict': model.state_dict(),
-        #         'optimizer_state_dict': optimizer.state_dict(),
-        #         'scheduler_state_dict': lr_scheduler.state_dict(),
-        #         'scaler_state_dict': scaler.state_dict()
-        #     }, checkpoint_path)
-        # except Exception as e:
-        #     logger.error(f"Error saving checkpoint at epoch {epoch}: {e}")
-        #     raise
-
-        # Evaluation Loop
-        # logger.info(f"Starting evaluation for epoch {epoch}.")
-        # model.eval()
-        # eval_loss = 0
-        # try:
-        #     for batch in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
-        #         batch = {k: v.to(device) for k, v in batch.items()}
-        #         with torch.no_grad():
-        #             outputs = model(**batch)
-        #             eval_loss += outputs.loss.item()
-        #     eval_loss /= len(eval_dataloader)
-        #     logger.info(f"Epoch {epoch}: Evaluation Loss: {eval_loss}")
-        # except Exception as e:
-        #     logger.error(f"Error during evaluation at epoch {epoch}: {e}")
-        #     raise
-
+        if is_distributed():
+            torch.distributed.barrier()
+        epoch_duration = time.time() - epoch_start_time
+        throughput = len(train_dataloader.dataset) / epoch_duration
+        avg_network_latency = total_network_latency / num_network_operations if num_network_operations > 0 else 0
+        if not is_distributed() or dist.get_rank() == 0:
+            logger.info(f"Epoch {epoch + 1} training_time: {epoch_duration:.2f} seconds")
+            logger.info(f"Epoch {epoch + 1} throughput: {throughput:.2f} samples/second")
+            logger.info(f"Epoch {epoch + 1} avg_network_latency: {avg_network_latency:.2f} seconds")
     cleanup_distributed()
 
 
