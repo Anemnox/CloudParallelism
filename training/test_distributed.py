@@ -10,12 +10,13 @@ import boto3
 
 # Initialize session and other common variables
 session = boto3.Session()
-role = os.getenv("SAGEMAKER_ROLE")
+role = "<insert role>"
 region = session.region_name
-bucket = "tcss562-west"
+bucket = "tcss562-cloud-computing-project"
 
 # Set up S3 paths for input data and model output
-train_data_s3_uri = f"s3://{bucket}/train-clean-100/"
+train_data_s3_uri = f"s3://{bucket}/small-test/train-clean-100/"
+#train_data_s3_uri = f"s3://{bucket}/small-test/dev-clean/"
 validation_data_s3_uri = f"s3://{bucket}/small-test/"
 output_path = f"s3://{bucket}/training-output/"
 
@@ -23,12 +24,13 @@ output_path = f"s3://{bucket}/training-output/"
 training_script = "training.py"
 QUOTA = 16
 SEED_NUMBER = 42
-instance_type = "ml.g4dn.2xlarge"
+instance_type = "ml.g4dn.12xlarge"
 configurations = [
-    #{"instance_count": 1, "epochs": 2},
-    #{"instance_count": 2, "epochs": 1},
+    #{"instance_count": 1, "epochs": 1},
+    {"instance_count": 2, "epochs": 1},
+    #{"instance_count": 3, "epochs": 1},
     #{"instance_count": 4, "epochs": 1},
-    {"instance_count": 8, "epochs": 1},
+    #{"instance_count": 8, "epochs": 1},
     #{"instance_count": 12, "epochs": 1}  # Uncomment if quota allows
     #{"instance_count": 16, "epochs": 1}
 ]
@@ -86,6 +88,12 @@ def train_with_config(config):
         sagemaker_session=Session(boto_session=session),
         instance_count=config["instance_count"],
         instance_type=instance_type,
+        use_spot_instances=True, # Enable spot instances
+        max_run=3600*3,
+        max_wait=3600*3,  # Max time including interruptions
+        max_retry_attempts=30,
+        checkpoint_s3_uri=f"s3://{bucket}/checkpoints/",  # Save checkpoints to S3
+        checkpoint_local_path='/opt/ml/checkpoints',
         enable_sagemaker_metrics=True,
         metric_definitions=metric_definitions
     )

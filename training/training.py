@@ -84,8 +84,9 @@ def parse_args():
     parser.add_argument(
         "--checkpoint_dir",
         type=str,
-        default="checkpoints",
+        default="/opt/ml/checkpoints",
         help="Directory to save checkpoints during training.",
+
     )
     parser.add_argument(
         "--max_duration_in_seconds",
@@ -192,6 +193,31 @@ def cleanup_distributed():
 #
 # Load Datasets
 #
+
+def save_checkpoint(model, optimizer, scheduler, epoch, args):
+    checkpoint_path = os.path.join(args.checkpoint_dir, f"checkpoint_epoch{epoch}.pt")
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+    }, checkpoint_path)
+    logger.info(f"Checkpoint saved: {checkpoint_path}")
+
+
+def load_checkpoint(model, optimizer, scheduler, args):
+    checkpoint_files = [f for f in os.listdir(args.checkpoint_dir) if f.endswith('.pt')]
+    if checkpoint_files:
+        latest_checkpoint = max(checkpoint_files, key=lambda f: os.path.getctime(os.path.join(args.checkpoint_dir, f)))
+        checkpoint_path = os.path.join(args.checkpoint_dir, latest_checkpoint)
+        checkpoint = torch.load(checkpoint_path, map_location=torch.device("cpu"))
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        logger.info(f"Checkpoint loaded: {checkpoint_path}")
+        return checkpoint['epoch'] + 1
+    return 0
+
 
 def load_datasets_from_s3():
     """
@@ -543,10 +569,14 @@ def main(args):
     except Exception as e:
         logger.error(f"Error setting up optimizer or learning rate scheduler: {e}")
         raise
-
+    try:    
+    # Load checkpoint if exists
+        start_epoch = load_checkpoint(model, optimizer, lr_scheduler, args)
+    except:
+        start_epoch = 0    
     scaler = GradScaler()
     completed_steps = 0
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         epoch_start_time = time.time()
         total_network_latency = 0
         num_network_operations = 0
@@ -676,6 +706,9 @@ def main(args):
         logger.info(f"Epoch {epoch + 1} training_time: {epoch_duration:.2f} seconds")
         logger.info(f"Epoch {epoch + 1} throughput: {throughput:.2f} samples/second")
         logger.info(f"Epoch {epoch + 1} avg_network_latency: {avg_network_latency:.2f} seconds")
+
+        # Save checkpoint at the end of each epoch
+        save_checkpoint(model, optimizer, lr_scheduler, epoch, args)
     
     cleanup_distributed()
 

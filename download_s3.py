@@ -4,8 +4,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 # AWS S3 bucket details
-BUCKET_NAME = "tcss562-west"  # Replace with your bucket name
-LOCAL_DIRECTORY = "small-test"  # Replace with your directory path
+BUCKET_NAME = "tcss562-cloud-computing-project"  # Replace with your bucket name
+LOCAL_DIRECTORY = "C:/Users/yeshu/Downloads/LibriSpeech"  # Replace with your directory path
 S3_DIRECTORY = "small-test"  # Replace with your desired S3 folder path (can be empty)
 
 # Initialize S3 client
